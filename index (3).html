@@ -1,0 +1,849 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Kelsey's Command Center · Oswald Marketing</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=DM+Serif+Display&display=swap" rel="stylesheet" />
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #080f18; color: #c8d8e8; font-family: 'DM Sans', -apple-system, sans-serif; }
+  select option { background: #1a2a3a; color: #c8d8e8; }
+  ::-webkit-scrollbar { width: 4px; } ::-webkit-scrollbar-track { background: transparent; } ::-webkit-scrollbar-thumb { background: #2a4060; border-radius: 2px; }
+  textarea, input, select { font-family: inherit; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback } = React;
+
+// ── CONFIG ─────────────────────────────────────────────────────
+const BOARD_ID = "18293041857";
+
+// Keys are stored in localStorage — entered once via the settings screen.
+// Nothing is hardcoded. Nothing is sent to GitHub. Stays in your browser.
+const getKeys = () => ({
+  anthropic: localStorage.getItem("occ_anthropic_key") || "",
+  monday: localStorage.getItem("occ_monday_token") || "",
+});
+const saveKeys = (anthropic, monday) => {
+  localStorage.setItem("occ_anthropic_key", anthropic);
+  localStorage.setItem("occ_monday_token", monday);
+};
+const keysExist = () => {
+  const k = getKeys();
+  return k.anthropic.length > 10 && k.monday.length > 10;
+};
+
+// ── API HELPERS ────────────────────────────────────────────────
+const callClaude = async (system, user) => {
+  const { anthropic } = getKeys();
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": anthropic,
+      "anthropic-version": "2023-06-01",
+      "anthropic-dangerous-direct-browser-access": "true",
+    },
+    body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 1000, system, messages: [{ role: "user", content: user }] }),
+  });
+  const data = await res.json();
+  return data.content?.[0]?.text || "";
+};
+
+const mondayGQL = async (query, variables = {}) => {
+  const { monday } = getKeys();
+  const res = await fetch("https://api.monday.com/v2", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": monday,
+      "API-Version": "2024-01",
+    },
+    body: JSON.stringify({ query, variables }),
+  });
+  return res.json();
+};
+
+const parseJ = (text, fb) => {
+  try {
+    const a = text.match(/\[[\s\S]*\]/); const o = text.match(/\{[\s\S]*\}/);
+    if (a) return JSON.parse(a[0]); if (o) return JSON.parse(o[0]);
+  } catch {} return fb;
+};
+
+// ── MONDAY GRAPHQL ─────────────────────────────────────────────
+const PEOPLE_IDS = { "Kelsey Dus":"56662866","Tyler Shaw":"74496514","Lauren Raben":"80356275","Randy Capehart":"72184093" };
+
+const fetchMondayTasks = async () => {
+  const q = `query GetTasks($boardId:ID!,$limit:Int){boards(ids:[$boardId]){items_page(limit:$limit,query_params:{rules:[{column_id:"project_status",compare_value:["1"],operator:not_any_of}]}){items{id name url column_values(ids:["project_owner","project_status","status_1","date_mkx5gxep","color_mkx525yx"]){id text}}}}}`;
+  const data = await mondayGQL(q, { boardId: BOARD_ID, limit: 60 });
+  const items = data?.data?.boards?.[0]?.items_page?.items || [];
+  return items.map(item => {
+    const col = {}; item.column_values?.forEach(c => { col[c.id] = c.text; });
+    return { id: item.id, name: item.name, url: item.url, owner: col["project_owner"]||"", status: col["project_status"]||"Not Started", priority: col["status_1"]||"", dueDate: col["date_mkx5gxep"]||"", client: col["color_mkx525yx"]||"" };
+  });
+};
+
+const updateMondayStatus = async (itemId, status) => {
+  const q = `mutation($boardId:ID!,$itemId:ID!,$value:JSON!){change_column_value(board_id:$boardId,item_id:$itemId,column_id:"project_status",value:$value){id}}`;
+  await mondayGQL(q, { boardId: BOARD_ID, itemId, value: JSON.stringify({ label: status }) });
+};
+
+const updateMondayOwner = async (itemId, ownerName) => {
+  const pid = PEOPLE_IDS[ownerName]; if (!pid) return;
+  const q = `mutation($boardId:ID!,$itemId:ID!,$value:JSON!){change_column_value(board_id:$boardId,item_id:$itemId,column_id:"project_owner",value:$value){id}}`;
+  await mondayGQL(q, { boardId: BOARD_ID, itemId, value: JSON.stringify({ personsAndTeams: [{ id: pid, kind: "person" }] }) });
+};
+
+const createMondayTask = async ({ name, owner, priority, client, dueDate }) => {
+  const pid = PEOPLE_IDS[owner];
+  const cv = { project_status:{label:"Not Started"}, ...(priority&&{status_1:{label:priority}}), ...(pid&&{project_owner:{personsAndTeams:[{id:pid,kind:"person"}]}}), ...(dueDate&&{date_mkx5gxep:{date:dueDate}}), ...(client&&{color_mkx525yx:{label:client}}) };
+  const q = `mutation($boardId:ID!,$name:String!,$columnValues:JSON!){create_item(board_id:$boardId,item_name:$name,column_values:$columnValues){id}}`;
+  const data = await mondayGQL(q, { boardId: BOARD_ID, name, columnValues: JSON.stringify(cv) });
+  return { id: data?.data?.create_item?.id || Date.now().toString() };
+};
+
+// ── CONSTANTS ──────────────────────────────────────────────────
+const DAYS=["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
+const MONTHS=["January","February","March","April","May","June","July","August","September","October","November","December"];
+const TEAM_MEMBERS=["Kelsey Dus","Tyler Shaw","Lauren Raben","Randy Capehart"];
+const SHORT={"Kelsey Dus":"Kelsey","Tyler Shaw":"Tyler","Lauren Raben":"Lauren","Randy Capehart":"Randy"};
+const PRIORITY_C={"Critical ⚠":"#ff4d6d",High:"#f4a261",Medium:"#5bb8ff",Low:"#52b788"};
+const STATUS_C={"Working on it":"#f4a261",Done:"#52b788",Stuck:"#ff4d6d","Client Approval":"#bda8f9","Sent to Vendor":"#579bfc","Not Started":"#4a6480","Internal Approval":"#ff5ac4",Ongoing:"#4eccc6","Pending Creative/Budget":"#a9bee8","Sent to creative":"#ff7575"};
+const ALL_STATUSES=["Not Started","Working on it","Stuck","Client Approval","Internal Approval","Sent to Vendor","Sent to creative","Ongoing","Pending Creative/Budget","Done"];
+const getGreeting=()=>{const h=new Date().getHours();return h<12?"Good morning":h<17?"Good afternoon":"Good evening";};
+
+// ── UI ATOMS ───────────────────────────────────────────────────
+const Card=({children,style={}})=><div style={{background:"rgba(255,255,255,0.03)",border:"1px solid rgba(255,255,255,0.07)",borderRadius:16,padding:"20px 24px",...style}}>{children}</div>;
+const Label=({children,style={}})=><div style={{fontSize:10,fontWeight:700,letterSpacing:"0.18em",textTransform:"uppercase",color:"#4a6480",marginBottom:14,fontFamily:"monospace",...style}}>{children}</div>;
+const Badge=({text,color})=><span style={{background:color+"22",color,border:`1px solid ${color}44`,borderRadius:4,padding:"2px 7px",fontSize:10,fontWeight:700,letterSpacing:"0.08em",textTransform:"uppercase",fontFamily:"monospace",whiteSpace:"nowrap"}}>{text}</span>;
+const Btn=({onClick,disabled,children,style={}})=><button onClick={onClick} disabled={disabled} style={{border:"none",borderRadius:8,padding:"8px 16px",fontSize:13,fontWeight:600,cursor:disabled?"not-allowed":"pointer",opacity:disabled?0.45:1,transition:"all 0.15s",...style}}>{children}</button>;
+
+function DateDisplay(){
+  const n=new Date();
+  return <div style={{textAlign:"right",lineHeight:1.3}}>
+    <div style={{fontSize:13,color:"#7a8a99",letterSpacing:"0.12em",textTransform:"uppercase",fontFamily:"monospace"}}>{DAYS[n.getDay()]}</div>
+    <div style={{fontSize:32,fontWeight:700,color:"#e8f0f8",fontFamily:"'DM Serif Display',Georgia,serif",lineHeight:1}}>{n.getDate()}</div>
+    <div style={{fontSize:12,color:"#7a8a99",letterSpacing:"0.08em",textTransform:"uppercase"}}>{MONTHS[n.getMonth()]} {n.getFullYear()}</div>
+  </div>;
+}
+
+// ── MONDAY TASK ROW ────────────────────────────────────────────
+function TaskRow({task,onStatusChange,onOwnerChange,onRemove}){
+  const [saving,setSaving]=useState(false);
+  const sc=STATUS_C[task.status]||"#4a6480", pc=PRIORITY_C[task.priority]||"#4a6480";
+  const overdue=task.dueDate&&new Date(task.dueDate)<new Date();
+  const doStatus=async v=>{setSaving(true);await updateMondayStatus(task.id,v);onStatusChange(task.id,v);setSaving(false);};
+  const doOwner=async v=>{setSaving(true);await updateMondayOwner(task.id,v);onOwnerChange(task.id,v);setSaving(false);};
+  return <div style={{padding:"10px 14px",background:"rgba(255,255,255,0.02)",borderRadius:10,border:"1px solid rgba(255,255,255,0.06)",marginBottom:8,opacity:saving?0.55:1,transition:"opacity 0.2s"}}>
+    <div style={{display:"flex",justifyContent:"space-between",gap:8}}>
+      <div style={{flex:1,minWidth:0}}>
+        <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:5,alignItems:"center"}}>
+          {task.priority&&<Badge text={task.priority} color={pc}/>}
+          {task.client&&<span style={{fontSize:11,color:"#4a6480",fontFamily:"monospace"}}>{task.client}</span>}
+          {task.dueDate&&<span style={{fontSize:10,color:overdue?"#ff4d6d":"#3a5570",fontFamily:"monospace"}}>{overdue?"⚠ ":""}due {task.dueDate}</span>}
+        </div>
+        <a href={task.url} target="_blank" rel="noreferrer" style={{fontSize:13,color:"#c8d8e8",textDecoration:"none",display:"block",marginBottom:8,lineHeight:1.4}}>{task.name}</a>
+        <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+          <select value={task.status||""} onChange={e=>doStatus(e.target.value)} disabled={saving} style={{background:"rgba(255,255,255,0.04)",border:`1px solid ${sc}44`,borderRadius:6,color:sc,padding:"3px 8px",fontSize:11,outline:"none",cursor:"pointer"}}>
+            {ALL_STATUSES.map(s=><option key={s}>{s}</option>)}
+          </select>
+          <select value={task.owner?.split(",")[0]?.trim()||""} onChange={e=>doOwner(e.target.value)} disabled={saving} style={{background:"rgba(255,255,255,0.04)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:6,color:"#7a9ab8",padding:"3px 8px",fontSize:11,outline:"none",cursor:"pointer"}}>
+            <option value="">— Owner —</option>
+            {TEAM_MEMBERS.map(m=><option key={m} value={m}>{SHORT[m]}</option>)}
+          </select>
+          {saving&&<span style={{fontSize:10,color:"#4a8ab0",fontFamily:"monospace",alignSelf:"center"}}>syncing…</span>}
+        </div>
+      </div>
+      <button onClick={()=>onRemove(task.id)} style={{background:"transparent",border:"none",color:"#2a4060",fontSize:18,cursor:"pointer",flexShrink:0,lineHeight:1}}>×</button>
+    </div>
+  </div>;
+}
+
+// ── MONDAY TASK BOARD ──────────────────────────────────────────
+function MondayTaskBoard({mondayTasks,setMondayTasks}){
+  const [loading,setLoading]=useState(false);
+  const [filter,setFilter]=useState("mine");
+  const [search,setSearch]=useState("");
+  const [showAdd,setShowAdd]=useState(false);
+  const [form,setForm]=useState({name:"",owner:"Kelsey Dus",priority:"Medium",client:"",dueDate:""});
+  const [adding,setAdding]=useState(false);
+  const [lastSync,setLastSync]=useState(null);
+
+  const load=useCallback(async()=>{
+    setLoading(true);
+    const data=await fetchMondayTasks();
+    if(Array.isArray(data)&&data.length>0){setMondayTasks(data);setLastSync(new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}));}
+    setLoading(false);
+  },[setMondayTasks]);
+
+  useEffect(()=>{load();},[load]);
+
+  const filtered=mondayTasks.filter(t=>{
+    if(filter==="mine"&&!t.owner?.includes("Kelsey"))return false;
+    if(filter==="team"&&t.owner?.includes("Kelsey"))return false;
+    if(filter==="stuck"&&t.status!=="Stuck")return false;
+    if(filter==="high"&&!["High","Critical ⚠"].includes(t.priority))return false;
+    if(search&&!t.name?.toLowerCase().includes(search.toLowerCase())&&!t.client?.toLowerCase().includes(search.toLowerCase()))return false;
+    return true;
+  });
+
+  const handleAdd=async()=>{
+    if(!form.name.trim())return; setAdding(true);
+    const result=await createMondayTask(form);
+    setMondayTasks(t=>[{id:result?.id||Date.now().toString(),...form,status:"Not Started",url:`https://oswald-marketing-creative.monday.com/boards/${BOARD_ID}`},...t]);
+    setForm({name:"",owner:"Kelsey Dus",priority:"Medium",client:"",dueDate:""}); setShowAdd(false); setAdding(false);
+  };
+
+  const FILTERS=[{k:"mine",l:"My Tasks"},{k:"team",l:"Team"},{k:"high",l:"High Priority"},{k:"stuck",l:"Stuck"},{k:"all",l:"All"}];
+
+  return <Card style={{gridColumn:"1 / -1"}}>
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14,flexWrap:"wrap",gap:8}}>
+      <div style={{display:"flex",alignItems:"center",gap:10}}>
+        <Label style={{marginBottom:0}}>📋 Non-Campaign Work · Monday.com</Label>
+        {lastSync&&<span style={{fontSize:10,color:"#2a4060",fontFamily:"monospace"}}>synced {lastSync}</span>}
+      </div>
+      <div style={{display:"flex",gap:8}}>
+        <button onClick={load} disabled={loading} style={{background:"transparent",border:"1px solid rgba(255,255,255,0.08)",borderRadius:7,color:loading?"#2a4060":"#4a6480",padding:"5px 12px",fontSize:11,cursor:loading?"not-allowed":"pointer",fontFamily:"monospace"}}>{loading?"syncing…":"↻ Refresh"}</button>
+        <button onClick={()=>setShowAdd(a=>!a)} style={{background:showAdd?"rgba(255,255,255,0.05)":"rgba(30,111,168,0.2)",border:"1px solid rgba(30,111,168,0.3)",borderRadius:7,color:"#5bb8ff",padding:"5px 12px",fontSize:12,fontWeight:600,cursor:"pointer"}}>{showAdd?"✕ Cancel":"+ New Task"}</button>
+      </div>
+    </div>
+    {showAdd&&<div style={{padding:14,background:"rgba(30,111,168,0.06)",borderRadius:12,border:"1px solid rgba(30,111,168,0.15)",marginBottom:14}}>
+      <div style={{fontSize:10,color:"#2a5a7a",fontFamily:"monospace",letterSpacing:"0.1em",marginBottom:10}}>NEW TASK → CREATES IN MONDAY.COM</div>
+      <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:8}}>
+        <input value={form.name} onChange={e=>setForm(f=>({...f,name:e.target.value}))} placeholder="Task name…" style={{flex:1,minWidth:200,background:"rgba(255,255,255,0.04)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:7,color:"#c8d8e8",padding:"7px 10px",fontSize:13,outline:"none"}}/>
+        <select value={form.owner} onChange={e=>setForm(f=>({...f,owner:e.target.value}))} style={{background:"rgba(255,255,255,0.05)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:7,color:"#7a9ab8",padding:"7px 10px",fontSize:12,outline:"none"}}>
+          {TEAM_MEMBERS.map(m=><option key={m} value={m}>{SHORT[m]}</option>)}
+        </select>
+        <select value={form.priority} onChange={e=>setForm(f=>({...f,priority:e.target.value}))} style={{background:"rgba(255,255,255,0.05)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:7,color:PRIORITY_C[form.priority]||"#4a6480",padding:"7px 10px",fontSize:12,outline:"none"}}>
+          {["Critical ⚠","High","Medium","Low"].map(p=><option key={p}>{p}</option>)}
+        </select>
+      </div>
+      <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+        <input value={form.client} onChange={e=>setForm(f=>({...f,client:e.target.value}))} placeholder="Client (optional)" style={{flex:1,minWidth:140,background:"rgba(255,255,255,0.03)",border:"1px solid rgba(255,255,255,0.07)",borderRadius:7,color:"#7a9ab8",padding:"6px 10px",fontSize:12,outline:"none"}}/>
+        <input type="date" value={form.dueDate} onChange={e=>setForm(f=>({...f,dueDate:e.target.value}))} style={{background:"rgba(255,255,255,0.03)",border:"1px solid rgba(255,255,255,0.07)",borderRadius:7,color:"#7a9ab8",padding:"6px 10px",fontSize:12,outline:"none"}}/>
+        <Btn onClick={handleAdd} disabled={!form.name.trim()||adding} style={{background:"linear-gradient(135deg,#1e6fa8,#0d4f80)",color:"#e8f4ff"}}>{adding?"Creating…":"Create in Monday →"}</Btn>
+      </div>
+    </div>}
+    <div style={{display:"flex",gap:6,marginBottom:12,flexWrap:"wrap",alignItems:"center"}}>
+      {FILTERS.map(f=><button key={f.k} onClick={()=>setFilter(f.k)} style={{background:filter===f.k?"rgba(30,111,168,0.25)":"rgba(255,255,255,0.03)",border:`1px solid ${filter===f.k?"rgba(30,111,168,0.4)":"rgba(255,255,255,0.07)"}`,borderRadius:7,color:filter===f.k?"#5bb8ff":"#4a6480",padding:"5px 12px",fontSize:11,fontWeight:filter===f.k?600:400,cursor:"pointer"}}>{f.l}</button>)}
+      <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search…" style={{marginLeft:"auto",background:"rgba(255,255,255,0.03)",border:"1px solid rgba(255,255,255,0.07)",borderRadius:7,color:"#7a9ab8",padding:"5px 10px",fontSize:12,outline:"none",width:150}}/>
+    </div>
+    {loading&&mondayTasks.length===0?<div style={{textAlign:"center",padding:"30px 0",color:"#2a4060",fontFamily:"monospace",fontSize:12}}>Loading from Monday.com…</div>
+    :filtered.length===0?<div style={{textAlign:"center",padding:"20px 0",color:"#2a4060",fontSize:13}}>No tasks match this filter.</div>
+    :<div style={{maxHeight:400,overflowY:"auto",paddingRight:4}}>
+      {filtered.map(t=><TaskRow key={t.id} task={t}
+        onStatusChange={(id,v)=>setMondayTasks(ts=>ts.map(x=>x.id===id?{...x,status:v}:x))}
+        onOwnerChange={(id,v)=>setMondayTasks(ts=>ts.map(x=>x.id===id?{...x,owner:v}:x))}
+        onRemove={id=>setMondayTasks(ts=>ts.filter(x=>x.id!==id))}/>)}
+    </div>}
+    <div style={{marginTop:10,fontSize:10,color:"#1a3050",fontFamily:"monospace"}}>{filtered.length} tasks · Status &amp; owner changes sync live to Monday.com</div>
+  </Card>;
+}
+
+// ── MORNING BRIEF ──────────────────────────────────────────────
+function MorningBrief({mondayTasks}){
+  const [brief,setBrief]=useState(null);
+  const [loading,setLoading]=useState(false);
+  const [extra,setExtra]=useState("");
+  const myTasks=mondayTasks.filter(t=>t.owner?.includes("Kelsey"));
+
+  const generate=async()=>{
+    setLoading(true);
+    const tc=myTasks.slice(0,12).map(t=>`- ${t.name} [${t.priority||"?"}] [${t.status}]${t.dueDate?` due ${t.dueDate}`:""}${t.client?` (${t.client})`:""}`).join("\n");
+    const r=await callClaude(`You are Kelsey's sharp chief of staff at Oswald Marketing, a boutique agency in Evansville. She manages client accounts, a small team, and internal ops. Respond ONLY in JSON: {"top3":[{"task":string,"why":string,"priority":"high"|"medium"|"low"}],"risk":string,"focus_word":string}. No markdown.`,`Open Monday tasks:\n${tc||"None"}\n\nExtra: ${extra||"none"}\n\nTop 3 priorities, biggest risk, one focus word.`);
+    try{setBrief(JSON.parse(r.replace(/```json|```/g,"").trim()));}catch{setBrief(null);}
+    setLoading(false);
+  };
+
+  return <Card>
+    <Label>☀ Morning Brief</Label>
+    {!brief?<div>
+      {myTasks.length>0&&<div style={{padding:"8px 12px",background:"rgba(30,111,168,0.08)",borderRadius:8,marginBottom:10,fontSize:12,color:"#4a8ab0"}}>✓ {myTasks.length} of your Monday tasks loaded automatically</div>}
+      <textarea value={extra} onChange={e=>setExtra(e.target.value)} placeholder="Anything extra? Meetings, fires, context not in Monday…" style={{width:"100%",boxSizing:"border-box",background:"rgba(255,255,255,0.04)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:10,color:"#c8d8e8",padding:"12px 14px",fontSize:13,resize:"vertical",minHeight:70,outline:"none"}}/>
+      <Btn onClick={generate} disabled={loading} style={{marginTop:10,background:loading?"#1a2a3a":"linear-gradient(135deg,#1e6fa8,#0d4f80)",color:loading?"#4a6480":"#e8f4ff"}}>{loading?"Generating…":"Generate My Brief →"}</Btn>
+    </div>:<div>
+      <div style={{marginBottom:16,padding:"10px 14px",background:"rgba(30,111,168,0.12)",borderRadius:10,borderLeft:"3px solid #1e6fa8"}}>
+        <div style={{fontSize:11,color:"#4a8ab0",fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.1em"}}>Today's Word</div>
+        <div style={{fontSize:26,fontWeight:700,color:"#5bb8ff",fontFamily:"'DM Serif Display',Georgia,serif"}}>{brief.focus_word}</div>
+      </div>
+      {brief.top3?.map((item,i)=><div key={i} style={{display:"flex",gap:12,marginBottom:12}}>
+        <div style={{width:22,height:22,borderRadius:"50%",background:"#1e6fa822",border:"1px solid #1e6fa844",display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,color:"#4a8ab0",fontWeight:700,flexShrink:0,marginTop:2}}>{i+1}</div>
+        <div>
+          <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:3,flexWrap:"wrap"}}>
+            <span style={{fontSize:14,fontWeight:600,color:"#c8d8e8"}}>{item.task}</span>
+            <Badge text={item.priority} color={item.priority==="high"?"#ff4d6d":item.priority==="medium"?"#f4a261":"#52b788"}/>
+          </div>
+          <div style={{fontSize:12,color:"#5a7a92"}}>{item.why}</div>
+        </div>
+      </div>)}
+      {brief.risk&&<div style={{padding:"8px 12px",background:"rgba(255,77,109,0.08)",border:"1px solid rgba(255,77,109,0.2)",borderRadius:8,fontSize:12,color:"#ff6b85"}}>⚠ {brief.risk}</div>}
+      <button onClick={()=>{setBrief(null);setExtra("");}} style={{marginTop:12,background:"transparent",border:"1px solid rgba(255,255,255,0.1)",borderRadius:7,color:"#4a6480",padding:"6px 14px",fontSize:12,cursor:"pointer"}}>Reset</button>
+    </div>}
+  </Card>;
+}
+
+// ── TEAM PULSE ─────────────────────────────────────────────────
+const PULSE_NAMES=["Lisa Schaffer","Fred McCool","Tammy Shaw"];
+const PULSE_STATUS=["✅ On track","⚠️ Needs attention","🔴 Blocked","💬 Awaiting response"];
+function TeamPulse({mondayTasks}){
+  const [pulse,setPulse]=useState(()=>PULSE_NAMES.reduce((a,n)=>({...a,[n]:{status:"",note:"",updated:null}}),{}));
+  const [editing,setEditing]=useState({});
+  const sc=s=>s.includes("✅")?"#52b788":s.includes("⚠️")?"#f4a261":s.includes("🔴")?"#ff4d6d":s.includes("💬")?"#4a8ab0":"#4a6480";
+  const upd=(n,f,v)=>setPulse(p=>({...p,[n]:{...p[n],[f]:v,updated:new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"})}}));
+  const load={Tyler:mondayTasks.filter(t=>t.owner?.includes("Tyler")&&t.status!=="Done").length,Lauren:mondayTasks.filter(t=>t.owner?.includes("Lauren")&&t.status!=="Done").length,Randy:mondayTasks.filter(t=>t.owner?.includes("Randy")&&t.status!=="Done").length};
+  return <Card>
+    <Label>👥 Team Pulse</Label>
+    {mondayTasks.length>0&&<div style={{display:"flex",gap:8,marginBottom:12,flexWrap:"wrap"}}>
+      {Object.entries(load).map(([name,count])=><div key={name} style={{padding:"4px 10px",background:"rgba(255,255,255,0.03)",border:"1px solid rgba(255,255,255,0.07)",borderRadius:6,fontSize:11}}>
+        <span style={{color:"#4a6480"}}>{name} </span><span style={{color:count>5?"#f4a261":"#52b788",fontWeight:700}}>{count}</span><span style={{color:"#2a4060"}}> open</span>
+      </div>)}
+    </div>}
+    {PULSE_NAMES.map(name=><div key={name} style={{padding:"12px 14px",background:"rgba(255,255,255,0.02)",borderRadius:10,border:"1px solid rgba(255,255,255,0.06)",marginBottom:10}}>
+      <div style={{display:"flex",justifyContent:"space-between",marginBottom:8}}>
+        <span style={{fontSize:13,fontWeight:600,color:"#c8d8e8"}}>{name}</span>
+        {pulse[name].updated&&<span style={{fontSize:10,color:"#3a5570",fontFamily:"monospace"}}>{pulse[name].updated}</span>}
+      </div>
+      <select value={pulse[name].status} onChange={e=>upd(name,"status",e.target.value)} style={{background:"rgba(255,255,255,0.05)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:7,color:pulse[name].status?sc(pulse[name].status):"#4a6480",padding:"5px 10px",fontSize:12,width:"100%",marginBottom:6,outline:"none"}}>
+        <option value="">— Set status —</option>
+        {PULSE_STATUS.map(s=><option key={s}>{s}</option>)}
+      </select>
+      {editing[name]?<input autoFocus value={pulse[name].note} onChange={e=>upd(name,"note",e.target.value)} onBlur={()=>setEditing(x=>({...x,[name]:false}))} placeholder="Quick note…" style={{width:"100%",boxSizing:"border-box",background:"rgba(255,255,255,0.04)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:7,color:"#a8bdd0",padding:"5px 10px",fontSize:12,outline:"none"}}/>
+      :<div onClick={()=>setEditing(x=>({...x,[name]:true}))} style={{fontSize:12,color:pulse[name].note?"#7a9ab8":"#2a4560",cursor:"pointer",minHeight:18}}>{pulse[name].note||"+ Add note"}</div>}
+    </div>)}
+  </Card>;
+}
+
+// ── NOTES & THOUGHTS ──────────────────────────────────────────
+const NOTE_TAGS=["Idea","Decision","Follow-up","Risk","Win","General"];
+const NOTE_TAG_C={Idea:"#6b2fa0",Decision:"#1e6fa8","Follow-up":"#f4a261",Risk:"#ff4d6d",Win:"#52b788",General:"#4a6480"};
+function NotesThoughts({onNotesChange}){
+  const [notes,setNotes]=useState([]);
+  const [input,setInput]=useState("");
+  const [tag,setTag]=useState("General");
+  const [filter,setFilter]=useState("All");
+  const add=()=>{
+    if(!input.trim())return;
+    const note={id:Date.now(),text:input.trim(),tag,ts:new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}),day:new Date().toLocaleDateString("en-US",{weekday:"short",month:"short",day:"numeric"})};
+    const next=[note,...notes]; setNotes(next); onNotesChange(next); setInput("");
+  };
+  const remove=id=>{const next=notes.filter(n=>n.id!==id);setNotes(next);onNotesChange(next);};
+  const filtered=filter==="All"?notes:notes.filter(n=>n.tag===filter);
+  return <Card>
+    <Label>📝 Notes &amp; Thoughts</Label>
+    <textarea value={input} onChange={e=>setInput(e.target.value)} onKeyDown={e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();add();}}} placeholder="Capture a thought, idea, decision… (Enter to save)" style={{width:"100%",boxSizing:"border-box",background:"rgba(255,255,255,0.04)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:9,color:"#c8d8e8",padding:"10px 12px",fontSize:13,resize:"none",minHeight:60,outline:"none",marginBottom:10}}/>
+    <div style={{display:"flex",gap:8,marginBottom:14,alignItems:"center",flexWrap:"wrap"}}>
+      {NOTE_TAGS.map(t=><button key={t} onClick={()=>setTag(t)} style={{background:tag===t?NOTE_TAG_C[t]+"33":"rgba(255,255,255,0.03)",border:`1px solid ${tag===t?NOTE_TAG_C[t]+"66":"rgba(255,255,255,0.07)"}`,borderRadius:6,color:tag===t?NOTE_TAG_C[t]:"#4a6480",padding:"4px 10px",fontSize:11,cursor:"pointer",fontWeight:tag===t?700:400}}>{t}</button>)}
+      <Btn onClick={add} disabled={!input.trim()} style={{marginLeft:"auto",background:"linear-gradient(135deg,#1a3a5e,#0d2540)",color:"#a8ccf0",padding:"6px 14px"}}>Save →</Btn>
+    </div>
+    {notes.length>0&&<div style={{display:"flex",gap:6,marginBottom:10,flexWrap:"wrap"}}>
+      {["All",...NOTE_TAGS].map(t=><button key={t} onClick={()=>setFilter(t)} style={{background:filter===t?"rgba(255,255,255,0.06)":"transparent",border:"1px solid rgba(255,255,255,0.07)",borderRadius:5,color:filter===t?"#c8d8e8":"#3a5570",padding:"3px 8px",fontSize:10,cursor:"pointer",fontFamily:"monospace"}}>{t}</button>)}
+    </div>}
+    {filtered.length===0&&<div style={{fontSize:13,color:"#2a4060",textAlign:"center",padding:"12px 0"}}>No notes yet. Capture anything.</div>}
+    <div style={{display:"flex",flexDirection:"column",gap:7,maxHeight:280,overflowY:"auto"}}>
+      {filtered.map(note=><div key={note.id} style={{padding:"9px 12px",background:"rgba(255,255,255,0.02)",borderRadius:9,border:`1px solid ${NOTE_TAG_C[note.tag]}22`,borderLeft:`3px solid ${NOTE_TAG_C[note.tag]}`}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:8}}>
+          <div style={{flex:1}}>
+            <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:4}}>
+              <span style={{fontSize:10,fontWeight:700,color:NOTE_TAG_C[note.tag],fontFamily:"monospace",letterSpacing:"0.08em"}}>{note.tag}</span>
+              <span style={{fontSize:10,color:"#2a4060",fontFamily:"monospace"}}>{note.day} · {note.ts}</span>
+            </div>
+            <div style={{fontSize:13,color:"#b8cce0",lineHeight:1.5}}>{note.text}</div>
+          </div>
+          <button onClick={()=>remove(note.id)} style={{background:"transparent",border:"none",color:"#2a4060",fontSize:16,cursor:"pointer",flexShrink:0}}>×</button>
+        </div>
+      </div>)}
+    </div>
+  </Card>;
+}
+
+// ── UNPLANNED INTAKE ───────────────────────────────────────────
+const INTAKE_C={"Do It":"#52b788",Delegate:"#1e6fa8",Defer:"#f4a261"};
+function UnplannedIntake({onPushToMonday}){
+  const [items,setItems]=useState([]);
+  const [input,setInput]=useState("");
+  const [ctx,setCtx]=useState("");
+  const [loading,setLoading]=useState(false);
+  const [showAdd,setShowAdd]=useState(false);
+  const unplanned=items.filter(i=>i.type==="unplanned").length;
+  const pct=items.length>0?Math.round((unplanned/items.length)*100):0;
+
+  const addUnplanned=async()=>{
+    if(!input.trim())return; setLoading(true);
+    const id=Date.now();
+    setItems(i=>[...i,{id,task:input,type:"unplanned",ctx,loading:true,pushedToMonday:false}]);
+    setInput(""); setCtx(""); setShowAdd(false);
+    const r=await callClaude(`You are Kelsey's chief of staff at Oswald Marketing. Respond ONLY in JSON: {"rec":"Do It"|"Delegate"|"Defer","why":string,"who":string|null}. If delegating suggest Tyler, Randy, or Lauren. No markdown.`,`Unplanned task: "${input}"\nContext: ${ctx||"none"}`);
+    try{const p=JSON.parse(r.replace(/```json|```/g,"").trim());setItems(i=>i.map(x=>x.id===id?{...x,...p,loading:false}:x));}
+    catch{setItems(i=>i.map(x=>x.id===id?{...x,loading:false}:x));}
+    setLoading(false);
+  };
+  const pushToMonday=async item=>{
+    await onPushToMonday({name:item.task,owner:item.who?`${item.who} Shaw`:"Kelsey Dus",priority:"Medium",client:"",dueDate:""});
+    setItems(i=>i.map(x=>x.id===item.id?{...x,pushedToMonday:true}:x));
+  };
+
+  return <Card>
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
+      <Label style={{marginBottom:0}}>🌊 Unplanned Intake</Label>
+      <button onClick={()=>setShowAdd(a=>!a)} style={{background:showAdd?"rgba(255,255,255,0.05)":"rgba(244,162,97,0.15)",border:"1px solid rgba(244,162,97,0.25)",borderRadius:7,color:"#f4a261",padding:"5px 12px",fontSize:12,fontWeight:600,cursor:"pointer"}}>{showAdd?"✕":"+ Log"}</button>
+    </div>
+    {items.length>0&&<div style={{marginBottom:12}}>
+      <div style={{display:"flex",justifyContent:"space-between",marginBottom:4}}>
+        <span style={{fontSize:11,color:"#52b788",fontFamily:"monospace"}}>Planned: {items.length-unplanned}</span>
+        <span style={{fontSize:11,color:pct>40?"#ff4d6d":"#f4a261",fontFamily:"monospace"}}>Unplanned: {unplanned} ({pct}%)</span>
+      </div>
+      <div style={{height:5,borderRadius:3,background:"rgba(255,255,255,0.06)"}}>
+        <div style={{height:"100%",width:`${pct}%`,background:pct>40?"#ff4d6d":"#f4a261",borderRadius:3,transition:"width 0.4s"}}/>
+      </div>
+      {pct>40&&<div style={{marginTop:5,fontSize:11,color:"#ff6b85",fontFamily:"monospace"}}>⚠ Day is off-plan — consider deferring</div>}
+    </div>}
+    {showAdd&&<div style={{padding:12,background:"rgba(244,162,97,0.05)",borderRadius:10,border:"1px solid rgba(244,162,97,0.12)",marginBottom:12}}>
+      <input value={input} onChange={e=>setInput(e.target.value)} placeholder="What just landed on you?" style={{width:"100%",boxSizing:"border-box",background:"rgba(255,255,255,0.04)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:7,color:"#c8d8e8",padding:"8px 10px",fontSize:13,outline:"none",marginBottom:7}}/>
+      <input value={ctx} onChange={e=>setCtx(e.target.value)} placeholder="Context? (urgency, client, who asked)" style={{width:"100%",boxSizing:"border-box",background:"rgba(255,255,255,0.03)",border:"1px solid rgba(255,255,255,0.07)",borderRadius:7,color:"#7a9ab8",padding:"6px 10px",fontSize:12,outline:"none",marginBottom:8}}/>
+      <div style={{display:"flex",gap:8}}>
+        <Btn onClick={addUnplanned} disabled={!input.trim()||loading} style={{flex:1,background:"linear-gradient(135deg,#8a4a10,#6a3008)",color:"#ffd4a8"}}>{loading?"Analyzing…":"🌊 Log + Get Rec"}</Btn>
+        <Btn onClick={()=>{setItems(i=>[...i,{id:Date.now(),task:input,type:"planned"}]);setInput("");setShowAdd(false);}} disabled={!input.trim()} style={{background:"rgba(82,183,136,0.1)",color:"#52b788"}}>✅ Planned</Btn>
+      </div>
+    </div>}
+    {items.map(item=><div key={item.id} style={{padding:"9px 12px",background:item.type==="unplanned"?"rgba(244,162,97,0.05)":"rgba(82,183,136,0.04)",borderRadius:9,border:`1px solid ${item.type==="unplanned"?"rgba(244,162,97,0.12)":"rgba(82,183,136,0.08)"}`,marginBottom:7}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+        <div style={{flex:1}}>
+          <div style={{display:"flex",gap:6,marginBottom:4,alignItems:"center"}}>
+            <span style={{fontSize:10,color:item.type==="unplanned"?"#f4a261":"#52b788",fontFamily:"monospace"}}>{item.type.toUpperCase()}</span>
+            <span style={{fontSize:13,color:"#c8d8e8"}}>{item.task}</span>
+          </div>
+          {item.loading&&<div style={{fontSize:11,color:"#4a6480",fontFamily:"monospace"}}>analyzing…</div>}
+          {item.rec&&<div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
+            <Badge text={`${item.rec}${item.who?` → ${item.who}`:""}`} color={INTAKE_C[item.rec]||"#4a6480"}/>
+            <span style={{fontSize:11,color:"#4a6480"}}>{item.why}</span>
+            {!item.pushedToMonday?<button onClick={()=>pushToMonday(item)} style={{background:"rgba(30,111,168,0.15)",border:"1px solid rgba(30,111,168,0.25)",borderRadius:5,color:"#4a8ab0",padding:"2px 8px",fontSize:10,cursor:"pointer",fontFamily:"monospace"}}>+ Monday</button>
+            :<span style={{fontSize:10,color:"#52b788",fontFamily:"monospace"}}>✓ in Monday</span>}
+          </div>}
+        </div>
+        <button onClick={()=>setItems(i=>i.filter(x=>x.id!==item.id))} style={{background:"transparent",border:"none",color:"#2a4060",fontSize:18,cursor:"pointer"}}>×</button>
+      </div>
+    </div>)}
+    {items.length===0&&!showAdd&&<div style={{fontSize:13,color:"#2a4060",textAlign:"center",padding:"16px 0"}}>Log tasks as they hit you. Track planned vs. unplanned.</div>}
+  </Card>;
+}
+
+// ── BRAIN DUMP ─────────────────────────────────────────────────
+function BrainDump(){
+  const [input,setInput]=useState(""); const [sorted,setSorted]=useState(null); const [loading,setLoading]=useState(false);
+  const sort=async()=>{if(!input.trim())return;setLoading(true);const r=await callClaude(`Respond ONLY in JSON: {"urgent_important":[string],"important_not_urgent":[string],"delegate_or_defer":[string]}. No markdown.`,`Sort using Eisenhower Matrix:\n${input}`);try{setSorted(JSON.parse(r.replace(/```json|```/g,"").trim()));}catch{setSorted(null);}setLoading(false);};
+  const Q=[{key:"urgent_important",label:"Do Now",color:"#ff4d6d",icon:"🔥"},{key:"important_not_urgent",label:"Schedule",color:"#f4a261",icon:"📅"},{key:"delegate_or_defer",label:"Delegate / Defer",color:"#52b788",icon:"→"}];
+  return <Card>
+    <Label>⚡ Brain Dump → Prioritized</Label>
+    {!sorted?<div>
+      <textarea value={input} onChange={e=>setInput(e.target.value)} placeholder="Dump everything — tasks, worries, ideas, follow-ups." style={{width:"100%",boxSizing:"border-box",background:"rgba(255,255,255,0.04)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:10,color:"#c8d8e8",padding:"12px 14px",fontSize:13,resize:"vertical",minHeight:90,outline:"none"}}/>
+      <Btn onClick={sort} disabled={loading||!input.trim()} style={{marginTop:10,background:loading?"#1a2a3a":"linear-gradient(135deg,#6b2fa0,#4a1f70)",color:loading?"#4a6480":"#e8d4ff"}}>{loading?"Sorting…":"Sort It →"}</Btn>
+    </div>:<div>
+      {Q.map(q=>sorted[q.key]?.length>0&&<div key={q.key} style={{marginBottom:14}}>
+        <div style={{fontSize:11,fontWeight:700,color:q.color,letterSpacing:"0.1em",textTransform:"uppercase",fontFamily:"monospace",marginBottom:6}}>{q.icon} {q.label}</div>
+        {sorted[q.key].map((x,i)=><div key={i} style={{fontSize:13,color:"#a8bdd0",padding:"5px 0 5px 12px",borderLeft:`2px solid ${q.color}33`,marginBottom:4}}>{x}</div>)}
+      </div>)}
+      <button onClick={()=>{setSorted(null);setInput("");}} style={{marginTop:4,background:"transparent",border:"1px solid rgba(255,255,255,0.1)",borderRadius:7,color:"#4a6480",padding:"6px 14px",fontSize:12,cursor:"pointer"}}>New Dump</button>
+    </div>}
+  </Card>;
+}
+
+// ── FOCUS MODE ─────────────────────────────────────────────────
+function FocusMode(){
+  const [task,setTask]=useState(""); const [active,setActive]=useState(false); const [seconds,setSeconds]=useState(25*60); const [running,setRunning]=useState(false); const ref=useRef(null);
+  useEffect(()=>{if(running&&seconds>0){ref.current=setInterval(()=>setSeconds(s=>s-1),1000);}else{clearInterval(ref.current);if(seconds===0)setRunning(false);}return()=>clearInterval(ref.current);},[running,seconds]);
+  const fmt=s=>`${String(Math.floor(s/60)).padStart(2,"0")}:${String(s%60).padStart(2,"0")}`;
+  const pct=((25*60-seconds)/(25*60))*100;
+  if(!active)return <Card><Label>🎯 Focus Mode</Label>
+    <input value={task} onChange={e=>setTask(e.target.value)} placeholder="What are you focusing on right now?" style={{width:"100%",boxSizing:"border-box",background:"rgba(255,255,255,0.04)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:10,color:"#c8d8e8",padding:"12px 14px",fontSize:14,outline:"none",marginBottom:10}}/>
+    <Btn onClick={()=>task.trim()&&setActive(true)} disabled={!task.trim()} style={{background:task.trim()?"linear-gradient(135deg,#1a5e3a,#0d3d25)":"#1a2a3a",color:task.trim()?"#a8ffcc":"#2a4560"}}>Enter Focus Mode →</Btn>
+  </Card>;
+  return <Card style={{textAlign:"center"}}><Label>🎯 Focus Mode — Active</Label>
+    <div style={{fontSize:15,color:"#52b788",marginBottom:20,fontWeight:600}}>{task}</div>
+    <div style={{position:"relative",width:140,height:140,margin:"0 auto 20px"}}>
+      <svg width="140" height="140" style={{transform:"rotate(-90deg)"}}>
+        <circle cx="70" cy="70" r="60" fill="none" stroke="rgba(255,255,255,0.05)" strokeWidth="8"/>
+        <circle cx="70" cy="70" r="60" fill="none" stroke="#52b788" strokeWidth="8" strokeDasharray={`${2*Math.PI*60}`} strokeDashoffset={`${2*Math.PI*60*(1-pct/100)}`} strokeLinecap="round" style={{transition:"stroke-dashoffset 1s linear"}}/>
+      </svg>
+      <div style={{position:"absolute",inset:0,display:"flex",alignItems:"center",justifyContent:"center",fontSize:32,fontWeight:700,color:"#e8f8ef",fontFamily:"monospace"}}>{fmt(seconds)}</div>
+    </div>
+    <div style={{display:"flex",gap:10,justifyContent:"center"}}>
+      <Btn onClick={()=>setRunning(r=>!r)} style={{background:running?"rgba(255,77,109,0.15)":"rgba(82,183,136,0.15)",color:running?"#ff4d6d":"#52b788",border:`1px solid ${running?"#ff4d6d44":"#52b78844"}`}}>{running?"Pause":"Start"}</Btn>
+      <Btn onClick={()=>{setActive(false);setSeconds(25*60);setRunning(false);setTask("");}} style={{background:"transparent",border:"1px solid rgba(255,255,255,0.1)",color:"#4a6480"}}>Exit</Btn>
+    </div>
+  </Card>;
+}
+
+// ── WEEK AT A GLANCE ───────────────────────────────────────────
+const WD=["Mon","Tue","Wed","Thu","Fri"];
+const BT=["Meeting","Client","Internal","Strategic","Admin","Buffer"];
+const BC={Meeting:"#ff4d6d",Client:"#1e6fa8",Internal:"#6b2fa0",Strategic:"#1a5e3a",Admin:"#6a4020",Buffer:"#2a4560"};
+const parseHrs=blocks=>blocks.reduce((sum,b)=>{
+  const label=(b.label+" "+(b.time||"")).toLowerCase();
+  const rm=label.match(/(\d+)(?::(\d+))?\s*(?:am|pm)?\s*[-–]\s*(\d+)(?::(\d+))?\s*(?:am|pm)?/);
+  if(rm){let[,sh,sm=0,eh,em=0]=rm;sh=parseInt(sh);eh=parseInt(eh);if(sh<=8)sh+=12;return sum+Math.max(0,(eh+em/60)-(sh+sm/60));}
+  const hm=label.match(/(\d+(?:\.\d+)?)\s*h/); if(hm)return sum+parseFloat(hm[1]);
+  const mm=label.match(/(\d+)\s*m(?:in)?/); if(mm)return sum+parseInt(mm[1])/60;
+  if(b.type==="Meeting")return sum+1; return sum;
+},0);
+
+function DayBar({day,blocks,workHours}){
+  const bookedHrs=parseHrs(blocks.filter(b=>b.type==="Meeting"));
+  const blockHrs=parseHrs(blocks.filter(b=>b.type!=="Meeting"));
+  const freeHrs=Math.max(0,workHours-bookedHrs-blockHrs);
+  const bp=Math.min(100,(bookedHrs/workHours)*100);
+  const blp=Math.min(100-bp,(blockHrs/workHours)*100);
+  const fp=Math.max(0,100-bp-blp);
+  const isToday=WD[new Date().getDay()-1]===day;
+  return <div style={{marginBottom:3}}>
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:3}}>
+      <span style={{fontSize:10,fontFamily:"monospace",color:isToday?"#5bb8ff":"#4a6480",fontWeight:isToday?700:400}}>{day}</span>
+      <span style={{fontSize:10,fontFamily:"monospace",color:freeHrs<1.5?"#ff4d6d":"#52b788"}}>{freeHrs<=0?"full":`${freeHrs.toFixed(1)}h free`}</span>
+    </div>
+    <div style={{height:8,borderRadius:4,background:"rgba(255,255,255,0.05)",overflow:"hidden",display:"flex"}}>
+      {bp>0&&<div style={{width:`${bp}%`,background:"#ff4d6d99",transition:"width 0.3s"}}/>}
+      {blp>0&&<div style={{width:`${blp}%`,background:"#1e6fa877",transition:"width 0.3s"}}/>}
+      {fp>0&&<div style={{width:`${fp}%`,background:"#52b78833",transition:"width 0.3s"}}/>}
+    </div>
+  </div>;
+}
+
+function WeekGlance(){
+  const [blocks,setBlocks]=useState({});
+  const [adding,setAdding]=useState(null);
+  const [form,setForm]=useState({type:"Meeting",label:"",time:""});
+  const [workHours,setWorkHours]=useState(8);
+  const [showBars,setShowBars]=useState(true);
+  const add=()=>{if(!form.label.trim())return;setBlocks(b=>({...b,[adding]:[...(b[adding]||[]),{...form,id:Date.now()}]}));setAdding(null);setForm({type:"Meeting",label:"",time:""});};
+  const todayKey=WD[new Date().getDay()-1];
+  const todayFree=todayKey?Math.max(0,workHours-parseHrs(blocks[todayKey]||[])):null;
+  return <Card>
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
+      <Label style={{marginBottom:0}}>📅 Week at a Glance</Label>
+      <div style={{display:"flex",alignItems:"center",gap:10}}>
+        {todayFree!==null&&<span style={{fontSize:11,fontFamily:"monospace",color:todayFree<1.5?"#ff4d6d":"#52b788"}}>{todayFree<=0?"Today: packed":`Today: ${todayFree.toFixed(1)}h free`}</span>}
+        <button onClick={()=>setShowBars(s=>!s)} style={{background:"transparent",border:"1px solid rgba(255,255,255,0.08)",borderRadius:6,color:"#3a5570",padding:"3px 8px",fontSize:10,cursor:"pointer",fontFamily:"monospace"}}>{showBars?"hide bars":"show bars"}</button>
+      </div>
+    </div>
+    {showBars&&<div style={{marginBottom:14,padding:"10px 14px",background:"rgba(255,255,255,0.02)",borderRadius:10,border:"1px solid rgba(255,255,255,0.06)"}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+        <div style={{display:"flex",gap:12,flexWrap:"wrap"}}>
+          <span style={{fontSize:10,color:"#ff4d6d",fontFamily:"monospace"}}>■ Meetings</span>
+          <span style={{fontSize:10,color:"#4a8ab0",fontFamily:"monospace"}}>■ Blocks</span>
+          <span style={{fontSize:10,color:"#52b788",fontFamily:"monospace"}}>■ Free</span>
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:6}}>
+          <span style={{fontSize:10,color:"#4a6480",fontFamily:"monospace"}}>Work hrs/day:</span>
+          <input type="number" min="4" max="12" value={workHours} onChange={e=>setWorkHours(Number(e.target.value))} style={{width:40,background:"rgba(255,255,255,0.05)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:5,color:"#c8d8e8",padding:"2px 6px",fontSize:11,outline:"none",textAlign:"center"}}/>
+        </div>
+      </div>
+      {WD.map(d=><DayBar key={d} day={d} blocks={blocks[d]||[]} workHours={workHours}/>)}
+      <div style={{marginTop:8,fontSize:9,color:"#1a3050",fontFamily:"monospace"}}>📍 Outlook: connect in Claude Settings → Integrations to auto-populate</div>
+    </div>}
+    <div style={{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:8}}>
+      {WD.map(d=>{const isToday=WD[new Date().getDay()-1]===d;return <div key={d}>
+        <div style={{fontSize:11,fontWeight:700,color:isToday?"#5bb8ff":"#4a6480",textAlign:"center",marginBottom:6,fontFamily:"monospace",letterSpacing:"0.1em",borderBottom:isToday?"1px solid #5bb8ff44":"none",paddingBottom:isToday?3:0}}>{d}</div>
+        <div style={{minHeight:80,display:"flex",flexDirection:"column",gap:4}}>
+          {(blocks[d]||[]).map(b=><div key={b.id} onClick={()=>setBlocks(bl=>({...bl,[d]:bl[d].filter(x=>x.id!==b.id)}))} title="Click to remove" style={{background:BC[b.type]+"33",border:`1px solid ${BC[b.type]}66`,borderRadius:6,padding:"4px 6px",fontSize:10,color:"#c8d8e8",cursor:"pointer",lineHeight:1.3}}>
+            {b.time&&<span style={{color:BC[b.type]+"cc",fontFamily:"monospace",display:"block",fontSize:9}}>{b.time}</span>}{b.label}
+          </div>)}
+          <button onClick={()=>setAdding(d)} style={{background:"rgba(255,255,255,0.02)",border:"1px dashed rgba(255,255,255,0.08)",borderRadius:6,color:"#2a4060",fontSize:16,cursor:"pointer",padding:"4px",lineHeight:1}}>+</button>
+        </div>
+      </div>;})}
+    </div>
+    {adding&&<div style={{marginTop:14,padding:14,background:"rgba(255,255,255,0.03)",borderRadius:10,border:"1px solid rgba(255,255,255,0.08)"}}>
+      <div style={{fontSize:11,color:"#4a6480",marginBottom:8,fontFamily:"monospace"}}>ADD — {adding}</div>
+      <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+        <select value={form.type} onChange={e=>setForm(f=>({...f,type:e.target.value}))} style={{background:"rgba(255,255,255,0.05)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:7,color:BC[form.type]||"#c8d8e8",padding:"6px 10px",fontSize:12,outline:"none"}}>
+          {BT.map(t=><option key={t}>{t}</option>)}
+        </select>
+        <input value={form.time} onChange={e=>setForm(f=>({...f,time:e.target.value}))} placeholder="9am-10am or 1h" style={{width:110,background:"rgba(255,255,255,0.04)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:7,color:"#c8d8e8",padding:"6px 10px",fontSize:12,outline:"none"}}/>
+        <input value={form.label} onChange={e=>setForm(f=>({...f,label:e.target.value}))} placeholder="Label…" style={{flex:1,minWidth:100,background:"rgba(255,255,255,0.04)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:7,color:"#c8d8e8",padding:"6px 10px",fontSize:12,outline:"none"}}/>
+        <Btn onClick={add} style={{background:"#1e6fa822",border:"1px solid #1e6fa844",color:"#4a8ab0",padding:"6px 14px"}}>Add</Btn>
+        <Btn onClick={()=>setAdding(null)} style={{background:"transparent",border:"1px solid rgba(255,255,255,0.08)",color:"#3a5570",padding:"6px 10px"}}>✕</Btn>
+      </div>
+      <div style={{marginTop:6,fontSize:10,color:"#2a4060",fontFamily:"monospace"}}>Format: "9am-11am" or "2h" or "30m"</div>
+    </div>}
+  </Card>;
+}
+
+// ── EOD WRAP ───────────────────────────────────────────────────
+function EODWrap({onEodSave}){
+  const [wins,setWins]=useState(""); const [carries,setCarries]=useState(""); const [ref,setRef]=useState(null); const [loading,setLoading]=useState(false); const [recip,setRecip]=useState("me");
+  const gen=async()=>{
+    if(!wins.trim())return; setLoading(true);
+    const r=await callClaude(`Sharp end-of-day coach. Respond ONLY in JSON: {"momentum":string,"tomorrow_lead":string,"note_to_self":string}. No markdown.`,`Wins: ${wins}\nCarrying: ${carries||"none"}`);
+    try{const p=JSON.parse(r.replace(/```json|```/g,"").trim());setRef(p);if(onEodSave)onEodSave({wins,carries,...p,date:new Date().toLocaleDateString("en-US",{weekday:"short",month:"short",day:"numeric"})});}
+    catch{setRef(null);} setLoading(false);
+  };
+  const send=()=>{
+    if(!ref)return; const now=new Date();
+    const ds=now.toLocaleDateString("en-US",{weekday:"long",month:"long",day:"numeric"});
+    const to=recip==="tammy"?"tammy@oswaldmarketing.com":"";
+    const sub=encodeURIComponent(`EOD Wrap — ${ds}`);
+    const body=encodeURIComponent(`EOD WRAP — ${ds}\nOswald Marketing · Kelsey\n${"─".repeat(40)}\n\nWINS\n${wins}\n\nCARRYING FORWARD\n${carries||"Nothing noted"}\n\n${"─".repeat(40)}\n\nMOMENTUM\n${ref.momentum}\n\nLEAD WITH TOMORROW\n${ref.tomorrow_lead}\n\nNOTE TO SELF\n${ref.note_to_self}\n\n${"─".repeat(40)}\nSent from Kelsey's Command Center`);
+    window.location.href=`mailto:${to}?subject=${sub}&body=${body}`;
+  };
+  return <Card>
+    <Label>🌙 EOD Wrap</Label>
+    {!ref?<div>
+      <div style={{marginBottom:12}}>
+        <div style={{fontSize:11,color:"#4a6480",marginBottom:5,fontFamily:"monospace",letterSpacing:"0.08em"}}>WINS TODAY</div>
+        <textarea value={wins} onChange={e=>setWins(e.target.value)} placeholder="What got done?" style={{width:"100%",boxSizing:"border-box",background:"rgba(255,255,255,0.04)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:8,color:"#c8d8e8",padding:"10px 12px",fontSize:13,resize:"vertical",minHeight:70,outline:"none"}}/>
+      </div>
+      <div style={{marginBottom:12}}>
+        <div style={{fontSize:11,color:"#4a6480",marginBottom:5,fontFamily:"monospace",letterSpacing:"0.08em"}}>CARRYING FORWARD</div>
+        <textarea value={carries} onChange={e=>setCarries(e.target.value)} placeholder="What follows you into tomorrow?" style={{width:"100%",boxSizing:"border-box",background:"rgba(255,255,255,0.04)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:8,color:"#c8d8e8",padding:"10px 12px",fontSize:13,resize:"vertical",minHeight:60,outline:"none"}}/>
+      </div>
+      <Btn onClick={gen} disabled={loading||!wins.trim()} style={{background:loading?"#1a2a3a":"linear-gradient(135deg,#1a3a5e,#0d2540)",color:loading?"#4a6480":"#a8ccf0"}}>{loading?"Wrapping…":"Wrap the Day →"}</Btn>
+    </div>:<div>
+      <div style={{marginBottom:12,padding:"10px 14px",background:"rgba(30,111,168,0.1)",borderRadius:10}}>
+        <div style={{fontSize:10,color:"#2a5a7a",textTransform:"uppercase",letterSpacing:"0.1em",fontFamily:"monospace",marginBottom:4}}>Momentum</div>
+        <div style={{fontSize:13,color:"#a8ccf0"}}>{ref.momentum}</div>
+      </div>
+      <div style={{marginBottom:12,padding:"10px 14px",background:"rgba(82,183,136,0.08)",borderRadius:10}}>
+        <div style={{fontSize:10,color:"#1a5e3a",textTransform:"uppercase",letterSpacing:"0.1em",fontFamily:"monospace",marginBottom:4}}>Lead With Tomorrow</div>
+        <div style={{fontSize:13,color:"#7ad0a0",fontWeight:600}}>{ref.tomorrow_lead}</div>
+      </div>
+      <div style={{marginBottom:16,padding:"10px 14px",background:"rgba(244,162,97,0.08)",borderRadius:10}}>
+        <div style={{fontSize:10,color:"#6a4020",textTransform:"uppercase",letterSpacing:"0.1em",fontFamily:"monospace",marginBottom:4}}>Note to Self</div>
+        <div style={{fontSize:13,color:"#d4956a",fontStyle:"italic"}}>{ref.note_to_self}</div>
+      </div>
+      <div style={{borderTop:"1px solid rgba(255,255,255,0.06)",paddingTop:14}}>
+        <div style={{fontSize:11,color:"#4a6480",marginBottom:10,fontFamily:"monospace",letterSpacing:"0.1em"}}>SEND SUMMARY</div>
+        <div style={{display:"flex",gap:10,alignItems:"center",flexWrap:"wrap"}}>
+          <div style={{display:"flex",background:"rgba(255,255,255,0.04)",borderRadius:8,border:"1px solid rgba(255,255,255,0.08)",overflow:"hidden"}}>
+            {[{v:"me",l:"To Myself"},{v:"tammy",l:"CC Tammy"}].map(o=><button key={o.v} onClick={()=>setRecip(o.v)} style={{background:recip===o.v?"rgba(30,111,168,0.25)":"transparent",color:recip===o.v?"#5bb8ff":"#4a6480",border:"none",padding:"7px 16px",fontSize:12,fontWeight:recip===o.v?600:400,cursor:"pointer"}}>{o.l}</button>)}
+          </div>
+          <Btn onClick={send} style={{background:"linear-gradient(135deg,#1e6fa8,#0d4f80)",color:"#e8f4ff"}}>✉ Send EOD Email</Btn>
+        </div>
+        <div style={{marginTop:7,fontSize:11,color:"#2a4060",fontFamily:"monospace"}}>Opens your mail app · pre-filled</div>
+      </div>
+      <button onClick={()=>{setRef(null);setWins("");setCarries("");}} style={{marginTop:14,background:"transparent",border:"1px solid rgba(255,255,255,0.1)",borderRadius:7,color:"#4a6480",padding:"6px 14px",fontSize:12,cursor:"pointer"}}>Reset</button>
+    </div>}
+  </Card>;
+}
+
+// ── WEEKLY DIGEST ──────────────────────────────────────────────
+function WeeklyDigest({eodEntries,notes}){
+  const [recipients,setRecipients]=useState("");
+  const [extraContext,setExtraContext]=useState("");
+  const [digest,setDigest]=useState(null);
+  const [loading,setLoading]=useState(false);
+  const now=new Date();
+  const ws=new Date(now); ws.setDate(now.getDate()-now.getDay()+1);
+  const we=new Date(ws); we.setDate(ws.getDate()+4);
+  const weekLabel=`Week of ${ws.toLocaleDateString("en-US",{month:"short",day:"numeric"})} – ${we.toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"})}`;
+
+  const generate=async()=>{
+    setLoading(true);
+    const ec=eodEntries.length>0?eodEntries.map((e,i)=>`Day ${i+1}:\nWins: ${e.wins}\nCarried: ${e.carries}\nMomentum: ${e.momentum||""}`).join("\n\n"):"No EOD logs yet.";
+    const nc=notes.length>0?notes.map(n=>`[${n.tag}] ${n.text}`).join("\n"):"No notes captured.";
+    const r=await callClaude(`You are Kelsey's communications director at Oswald Marketing. Write a polished, concise weekly stakeholder recap. Tone: confident, professional, no fluff. Respond ONLY in JSON: {"subject":string,"highlights":[string],"decisions":[string],"next_week":[string],"closing":string}. No markdown.`,`Week: ${weekLabel}\n\nEOD Logs:\n${ec}\n\nNotes:\n${nc}\n\nExtra: ${extraContext||"none"}\n\nGenerate stakeholder weekly digest.`);
+    try{setDigest(JSON.parse(r.replace(/```json|```/g,"").trim()));}catch{setDigest(null);}
+    setLoading(false);
+  };
+
+  const sendEmail=()=>{
+    if(!digest)return;
+    const to=encodeURIComponent(recipients);
+    const sub=encodeURIComponent(digest.subject||`Oswald Marketing — Weekly Recap · ${weekLabel}`);
+    const body=encodeURIComponent(`${digest.subject||`Weekly Recap · ${weekLabel}`}\nOswald Marketing · Kelsey Dus\n${"─".repeat(44)}\n\nHIGHLIGHTS\n${(digest.highlights||[]).map(h=>`• ${h}`).join("\n")}\n\nKEY DECISIONS\n${(digest.decisions||[]).map(d=>`• ${d}`).join("\n")}\n\nNEXT WEEK\n${(digest.next_week||[]).map(n=>`• ${n}`).join("\n")}\n\n${"─".repeat(44)}\n${digest.closing||""}\n\nOswald Marketing · Dive Deeper`);
+    window.location.href=`mailto:${to}?subject=${sub}&body=${body}`;
+  };
+
+  return <Card style={{gridColumn:"1 / -1"}}>
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
+      <Label style={{marginBottom:0}}>📬 Weekly Digest</Label>
+      <span style={{fontSize:11,color:"#3a5570",fontFamily:"monospace"}}>{weekLabel}</span>
+    </div>
+    <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:12}}>
+      <div>
+        <div style={{fontSize:11,color:"#4a6480",marginBottom:5,fontFamily:"monospace",letterSpacing:"0.08em"}}>SEND TO</div>
+        <input value={recipients} onChange={e=>setRecipients(e.target.value)} placeholder="tammy@oswaldmarketing.com, client@example.com" style={{width:"100%",boxSizing:"border-box",background:"rgba(255,255,255,0.04)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:8,color:"#c8d8e8",padding:"8px 12px",fontSize:12,outline:"none"}}/>
+      </div>
+      <div>
+        <div style={{fontSize:11,color:"#4a6480",marginBottom:5,fontFamily:"monospace",letterSpacing:"0.08em"}}>EXTRA CONTEXT</div>
+        <input value={extraContext} onChange={e=>setExtraContext(e.target.value)} placeholder="Anything to highlight or de-emphasize…" style={{width:"100%",boxSizing:"border-box",background:"rgba(255,255,255,0.04)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:8,color:"#c8d8e8",padding:"8px 12px",fontSize:12,outline:"none"}}/>
+      </div>
+    </div>
+    <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:16,padding:"8px 12px",background:"rgba(255,255,255,0.02)",borderRadius:8,border:"1px solid rgba(255,255,255,0.06)"}}>
+      <span style={{fontSize:11,color:"#3a5570",fontFamily:"monospace"}}>Pulling from:</span>
+      <span style={{fontSize:11,color:eodEntries.length>0?"#52b788":"#3a5570"}}>{eodEntries.length>0?`✓ ${eodEntries.length} EOD log${eodEntries.length>1?"s":""}`:"○ No EOD logs yet"}</span>
+      <span style={{color:"#2a4060"}}>·</span>
+      <span style={{fontSize:11,color:notes.length>0?"#52b788":"#3a5570"}}>{notes.length>0?`✓ ${notes.length} note${notes.length>1?"s":""}`:"○ No notes yet"}</span>
+    </div>
+    {!digest?<Btn onClick={generate} disabled={loading} style={{background:loading?"#1a2a3a":"linear-gradient(135deg,#1a5e3a,#0d3d25)",color:loading?"#4a6480":"#a8ffcc"}}>{loading?"Building digest…":"Generate Weekly Digest →"}</Btn>
+    :<div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:12,marginBottom:14}}>
+        <div style={{padding:"12px 14px",background:"rgba(82,183,136,0.07)",borderRadius:10,border:"1px solid rgba(82,183,136,0.15)"}}>
+          <div style={{fontSize:10,color:"#1a5e3a",fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:8}}>Highlights</div>
+          {(digest.highlights||[]).map((h,i)=><div key={i} style={{fontSize:12,color:"#a8d4b8",marginBottom:5,paddingLeft:8,borderLeft:"2px solid #52b78844"}}>· {h}</div>)}
+        </div>
+        <div style={{padding:"12px 14px",background:"rgba(30,111,168,0.07)",borderRadius:10,border:"1px solid rgba(30,111,168,0.15)"}}>
+          <div style={{fontSize:10,color:"#1a4a7a",fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:8}}>Decisions Made</div>
+          {(digest.decisions||[]).map((d,i)=><div key={i} style={{fontSize:12,color:"#8ab8d8",marginBottom:5,paddingLeft:8,borderLeft:"2px solid #1e6fa844"}}>· {d}</div>)}
+        </div>
+        <div style={{padding:"12px 14px",background:"rgba(244,162,97,0.07)",borderRadius:10,border:"1px solid rgba(244,162,97,0.15)"}}>
+          <div style={{fontSize:10,color:"#6a4020",fontFamily:"monospace",textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:8}}>Next Week</div>
+          {(digest.next_week||[]).map((n,i)=><div key={i} style={{fontSize:12,color:"#d4a878",marginBottom:5,paddingLeft:8,borderLeft:"2px solid #f4a26144"}}>· {n}</div>)}
+        </div>
+      </div>
+      {digest.closing&&<div style={{fontSize:13,color:"#5a7a92",fontStyle:"italic",marginBottom:14,padding:"8px 12px",borderLeft:"2px solid rgba(255,255,255,0.1)"}}>{digest.closing}</div>}
+      <div style={{display:"flex",gap:10,alignItems:"center",flexWrap:"wrap"}}>
+        <Btn onClick={sendEmail} disabled={!recipients.trim()} style={{background:"linear-gradient(135deg,#1e6fa8,#0d4f80)",color:"#e8f4ff"}}>✉ Send Weekly Email</Btn>
+        {!recipients.trim()&&<span style={{fontSize:11,color:"#3a5070",fontFamily:"monospace"}}>Add recipients above to send</span>}
+        <button onClick={()=>setDigest(null)} style={{background:"transparent",border:"1px solid rgba(255,255,255,0.1)",borderRadius:7,color:"#4a6480",padding:"6px 14px",fontSize:12,cursor:"pointer",marginLeft:"auto"}}>Regenerate</button>
+      </div>
+    </div>}
+  </Card>;
+}
+
+// ── SETTINGS SCREEN ────────────────────────────────────────────
+function SettingsScreen({ onSave }) {
+  const existing = getKeys();
+  const [anthropic, setAnthropic] = useState(existing.anthropic);
+  const [monday, setMonday] = useState(existing.monday);
+  const [saved, setSaved] = useState(false);
+
+  const handleSave = () => {
+    if (!anthropic.trim() || !monday.trim()) return;
+    saveKeys(anthropic.trim(), monday.trim());
+    setSaved(true);
+    setTimeout(() => onSave(), 800);
+  };
+
+  const inputStyle = {
+    width: "100%", boxSizing: "border-box",
+    background: "rgba(255,255,255,0.04)",
+    border: "1px solid rgba(255,255,255,0.12)",
+    borderRadius: 10, color: "#c8d8e8",
+    padding: "12px 14px", fontSize: 14,
+    fontFamily: "monospace", outline: "none",
+    letterSpacing: "0.04em",
+  };
+
+  return (
+    <div style={{ minHeight: "100vh", background: "#080f18", backgroundImage: "radial-gradient(ellipse at 20% 10%,rgba(30,80,140,0.15) 0%,transparent 50%)", display: "flex", alignItems: "center", justifyContent: "center", padding: 24 }}>
+      <div style={{ width: "100%", maxWidth: 520 }}>
+        <div style={{ marginBottom: 36, textAlign: "center" }}>
+          <div style={{ fontSize: 11, color: "#2a4a6a", letterSpacing: "0.2em", textTransform: "uppercase", fontFamily: "monospace", marginBottom: 10 }}>Oswald Marketing</div>
+          <h1 style={{ fontSize: 28, fontWeight: 700, color: "#e8f0f8", fontFamily: "'DM Serif Display',Georgia,serif", margin: 0, marginBottom: 8 }}>Welcome, Kelsey.</h1>
+          <p style={{ fontSize: 13, color: "#3a5a7a", margin: 0 }}>Enter your API keys once to get started. They're saved in your browser — never sent anywhere else.</p>
+        </div>
+
+        <div style={{ background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.07)", borderRadius: 16, padding: "28px 28px" }}>
+          <div style={{ marginBottom: 22 }}>
+            <div style={{ fontSize: 11, color: "#4a6480", fontFamily: "monospace", letterSpacing: "0.12em", textTransform: "uppercase", marginBottom: 8 }}>Anthropic API Key</div>
+            <input
+              type="password"
+              value={anthropic}
+              onChange={e => setAnthropic(e.target.value)}
+              placeholder="sk-ant-api03-..."
+              style={inputStyle}
+            />
+            <div style={{ marginTop: 6, fontSize: 11, color: "#2a4060" }}>
+              Get yours at <span style={{ color: "#4a8ab0" }}>console.anthropic.com</span> → API Keys
+            </div>
+          </div>
+
+          <div style={{ marginBottom: 28 }}>
+            <div style={{ fontSize: 11, color: "#4a6480", fontFamily: "monospace", letterSpacing: "0.12em", textTransform: "uppercase", marginBottom: 8 }}>Monday.com API Token</div>
+            <input
+              type="password"
+              value={monday}
+              onChange={e => setMonday(e.target.value)}
+              placeholder="eyJhbGciOiJIUzI1NiJ9..."
+              style={inputStyle}
+            />
+            <div style={{ marginTop: 6, fontSize: 11, color: "#2a4060" }}>
+              Get yours at Monday.com → your avatar → <span style={{ color: "#4a8ab0" }}>Administration → API</span>
+            </div>
+          </div>
+
+          <button
+            onClick={handleSave}
+            disabled={!anthropic.trim() || !monday.trim() || saved}
+            style={{
+              width: "100%", padding: "14px", border: "none", borderRadius: 10,
+              background: saved ? "rgba(82,183,136,0.2)" : (!anthropic.trim() || !monday.trim()) ? "#1a2a3a" : "linear-gradient(135deg,#1e6fa8,#0d4f80)",
+              color: saved ? "#52b788" : (!anthropic.trim() || !monday.trim()) ? "#2a4060" : "#e8f4ff",
+              fontSize: 14, fontWeight: 700, cursor: (!anthropic.trim() || !monday.trim()) ? "not-allowed" : "pointer",
+              transition: "all 0.2s", letterSpacing: "0.04em",
+            }}
+          >
+            {saved ? "✓ Keys saved — loading your dashboard…" : "Save Keys & Launch Dashboard →"}
+          </button>
+
+          <div style={{ marginTop: 16, padding: "10px 14px", background: "rgba(30,111,168,0.06)", borderRadius: 8, border: "1px solid rgba(30,111,168,0.1)" }}>
+            <div style={{ fontSize: 11, color: "#3a5570", lineHeight: 1.6 }}>
+              🔒 Keys are stored in your browser's localStorage — only on this device, only in this browser. They are never sent to GitHub, Vercel, or anyone else. To update them later, click the ⚙ gear icon in the dashboard header.
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── MAIN APP ───────────────────────────────────────────────────
+function App(){
+  const [ready, setReady] = useState(keysExist());
+  const [showSettings, setShowSettings] = useState(false);
+  const [mondayTasks,setMondayTasks]=useState([]);
+  const [notes,setNotes]=useState([]);
+  const [eodEntries,setEodEntries]=useState([]);
+
+  if (!ready || showSettings) {
+    return <SettingsScreen onSave={() => { setReady(true); setShowSettings(false); }} />;
+  }
+
+  const pushToMonday=async(taskData)=>{
+    const result=await createMondayTask(taskData);
+    setMondayTasks(t=>[{id:result?.id||Date.now().toString(),...taskData,status:"Not Started",url:`https://oswald-marketing-creative.monday.com/boards/${BOARD_ID}`},...t]);
+  };
+
+  return <div style={{minHeight:"100vh",background:"#080f18",backgroundImage:"radial-gradient(ellipse at 20% 10%,rgba(30,80,140,0.15) 0%,transparent 50%),radial-gradient(ellipse at 80% 80%,rgba(107,47,160,0.1) 0%,transparent 50%)",fontFamily:"'DM Sans',-apple-system,sans-serif",color:"#c8d8e8",padding:"28px 24px 48px"}}>
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:32}}>
+      <div>
+        <div style={{fontSize:11,color:"#2a4a6a",letterSpacing:"0.2em",textTransform:"uppercase",fontFamily:"monospace",marginBottom:4}}>Oswald Marketing</div>
+        <h1 style={{margin:0,fontSize:28,fontWeight:700,color:"#e8f0f8",fontFamily:"'DM Serif Display',Georgia,serif",lineHeight:1.1}}>{getGreeting()}, Kelsey.</h1>
+        <div style={{fontSize:13,color:"#3a5a7a",marginTop:4}}>Your command center · Live Monday.com sync</div>
+      </div>
+      <div style={{display:"flex",alignItems:"flex-start",gap:12}}>
+        <button onClick={()=>setShowSettings(true)} title="Update API keys" style={{background:"rgba(255,255,255,0.03)",border:"1px solid rgba(255,255,255,0.07)",borderRadius:8,color:"#3a5570",padding:"6px 10px",fontSize:16,cursor:"pointer",lineHeight:1}}>⚙</button>
+        <DateDisplay/>
+      </div>
+    </div>
+    <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16,maxWidth:980,margin:"0 auto"}}>
+      <MondayTaskBoard mondayTasks={mondayTasks} setMondayTasks={setMondayTasks}/>
+      <MorningBrief mondayTasks={mondayTasks}/>
+      <WeekGlance/>
+      <TeamPulse mondayTasks={mondayTasks}/>
+      <NotesThoughts onNotesChange={setNotes}/>
+      <UnplannedIntake onPushToMonday={pushToMonday}/>
+      <BrainDump/>
+      <FocusMode/>
+      <div style={{gridColumn:"1 / -1"}}>
+        <EODWrap onEodSave={entry=>setEodEntries(prev=>[...prev,entry])}/>
+      </div>
+      <WeeklyDigest eodEntries={eodEntries} notes={notes}/>
+    </div>
+    <div style={{textAlign:"center",marginTop:32,fontSize:10,color:"#1a2a3a",letterSpacing:"0.15em",textTransform:"uppercase",fontFamily:"monospace"}}>
+      Oswald Marketing · Dive Deeper · Board {BOARD_ID}
+    </div>
+  </div>;
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
